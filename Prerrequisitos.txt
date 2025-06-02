@@ -1,0 +1,256 @@
+## Prerrequisitos
+
+* **Java Development Kit (JDK)**: Versión 11 o superior (recomendado 17+ para Quarkus).
+* **Apache Maven**: Para construir el proyecto Quarkus.
+* **Docker y Docker Compose (Recomendado)**: Para ejecutar fácilmente PostgreSQL, Kafka, Zookeeper, Kafka Connect y MongoDB. Alternativamente, puedes tener instalaciones locales.
+* **PostgreSQL Client (psql)**: Para interactuar con la base de datos PostgreSQL.
+* **MongoDB Shell (mongosh)** o MongoDB Compass: Para interactuar con MongoDB.
+* **curl** o similar: Para interactuar con la API REST de Kafka Connect.
+
+## Configuración y Ejecución
+
+Sigue estos pasos en orden:
+
+### Paso 1: PostgreSQL
+
+1.  **Iniciar PostgreSQL**:
+    Asegúrate de que tu servidor PostgreSQL esté en ejecución. Si usas Docker:
+    '''bash
+    docker run -d --name postgres-cdc \
+        -p 5432:5432 \
+        -e POSTGRES_USER=miusuario \
+        -e POSTGRES_PASSWORD=micontraseña \
+        -e POSTGRES_DB=mibd \
+        postgres:13 -c wal_level=logical
+    '''
+    *Reemplaza 'miusuario', 'micontraseña' y 'mibd' según necesites.*
+
+2.  **Crear Tabla y Datos de Prueba**:
+    Conéctate a tu instancia de PostgreSQL (usando 'psql' o tu cliente SQL preferido) y ejecuta el script ubicado en 'postgres_setup/init_db.sql'.
+
+    Contenido de 'postgres_setup/init_db.sql':
+    '''sql
+    -- Conéctate a tu base de datos (ej. mibd) antes de ejecutar esto.
+
+    DROP TABLE IF EXISTS clientes;
+
+    CREATE TABLE clientes (
+        id SERIAL PRIMARY KEY,
+        nombre VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        fecha_creacion TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Insertar datos de prueba
+    INSERT INTO clientes (nombre, email) VALUES ('juan perez', 'juan.perez@example.com');
+    INSERT INTO clientes (nombre, email) VALUES ('ana lopez', 'ana.lopez@example.com');
+    INSERT INTO clientes (nombre, email) VALUES ('carlos sanchez', 'carlos.sanchez@example.com');
+
+    -- Verificar
+    SELECT * FROM clientes;
+    '''
+
+### Paso 2: Kafka, Zookeeper y Kafka Connect con Debezium
+
+1.  **Iniciar Zookeeper y Kafka**:
+    Asegúrate de que Zookeeper y Kafka estén en ejecución. Si usas Docker Compose, puedes usar un archivo como el siguiente (ej. 'docker-compose.yml' en la raíz del proyecto):
+
+    '''yaml
+    version: '3.7'
+    services:
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.3.0
+        hostname: zookeeper
+        container_name: zookeeper
+        ports:
+          - "2181:2181"
+        environment:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+
+      kafka:
+        image: confluentinc/cp-kafka:7.3.0
+        hostname: kafka
+        container_name: kafka
+        depends_on:
+          - zookeeper
+        ports:
+          - "9092:9092" # Para clientes fuera de Docker (como tu app Quarkus local)
+          - "29092:29092" # Para clientes dentro de la red Docker (como Kafka Connect)
+        environment:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      kafka-connect:
+        image: confluentinc/cp-kafka-connect:7.3.0 # Asegúrate de que esta imagen tenga el conector Debezium o móntalo
+        hostname: kafka-connect
+        container_name: kafka-connect
+        depends_on:
+          - kafka
+        ports:
+          - "8083:8083"
+        environment:
+          CONNECT_BOOTSTRAP_SERVERS: 'kafka:29092'
+          CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+          CONNECT_REST_PORT: 8083
+          CONNECT_GROUP_ID: kafka-connect-group
+          CONNECT_CONFIG_STORAGE_TOPIC: _kafka_connect_configs
+          CONNECT_OFFSET_STORAGE_TOPIC: _kafka_connect_offsets
+          CONNECT_STATUS_STORAGE_TOPIC: _kafka_connect_status
+          CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+          CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+          CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+          CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+          CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components/" # Añade tu Debezium PG conector aquí
+        # Si necesitas añadir Debezium (si no está en la imagen base):
+        # volumes:
+        #   - ./path_to_debezium_pg_connector_dir:/usr/share/confluent-hub-components/debezium-connector-postgres
+
+    '''
+    Ejecuta con: 'docker-compose up -d zookeeper kafka' (espera a que inicien) y luego 'docker-compose up -d kafka-connect'.
+    *Nota: Necesitarás descargar el conector Debezium para PostgreSQL y hacerlo accesible a Kafka Connect, ya sea construyendo una imagen personalizada o montando el directorio del conector como un volumen.* Una forma fácil es usar la imagen 'debezium/connect:latest' que ya incluye los conectores.
+
+2.  **Configurar el Conector Debezium**:
+    Modifica el archivo 'kafka_connect_debezium/pg_clientes_connector.json' con los detalles de tu conexión a PostgreSQL. Asegúrate de que 'database.server.name' (e.g., 'dbserver1') y 'table.include.list' (e.g., 'public.clientes') sean correctos. El topic de Kafka se creará como '<database.server.name>.<schema_name>.<table_name>'.
+
+    Contenido de 'kafka_connect_debezium/pg_clientes_connector.json':
+    '''json
+    {
+      "name": "clientes-postgres-source-connector",
+      "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "plugin.name": "pgoutput",
+        "database.hostname": "host.docker.internal", // o tu IP de host si PostgreSQL no está en Docker y Kafka Connect sí
+                                                    // o "postgres-cdc" si ambos están en la misma red Docker
+        "database.port": "5432",
+        "database.user": "miusuario",             // Usuario de PostgreSQL
+        "database.password": "micontraseña",       // Contraseña de PostgreSQL
+        "database.dbname": "mibd",                // Base de datos de PostgreSQL
+        "database.server.name": "pgserver1",      // Nombre lógico, prefijará los topics
+        "table.include.list": "public.clientes",
+        "topic.prefix": "pgserver1",             // Asegura que el topic es pgserver1.public.clientes
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter.schemas.enable": "false",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "false",
+        "slot.name": "debezium_clientes_slot",    // Debe ser único
+        "publication.name": "debezium_clientes_pub", // Debe ser único
+        "publication.autocreate.mode": "filtered"
+      }
+    }
+    '''
+    *Si PostgreSQL está en Docker y Kafka Connect también, 'database.hostname' podría ser el nombre del servicio Docker de PostgreSQL (ej. 'postgres-cdc'). Si Kafka Connect está en Docker y PostgreSQL en el host, usa 'host.docker.internal' (en Mac/Windows) o la IP del host.*
+
+3.  **Cargar el Conector**:
+    Envía la configuración a la API REST de Kafka Connect (asumiendo que se ejecuta en 'localhost:8083'):
+    '''bash
+    curl -X POST -H "Content-Type: application/json" --data @kafka_connect_debezium/pg_clientes_connector.json http://localhost:8083/connectors
+    '''
+    Verifica el estado: 'curl http://localhost:8083/connectors/clientes-postgres-source-connector/status'
+
+### Paso 3: Java (Quarkus + Apache Camel)
+
+1.  **Iniciar MongoDB**:
+    Asegúrate de que MongoDB esté en ejecución. Si usas Docker:
+    '''bash
+    docker run -d --name mongo-db -p 27017:27017 mongo:latest
+    '''
+
+2.  **Navegar al Directorio del Proyecto Quarkus**:
+    '''bash
+    cd quarkus_camel_processor
+    '''
+
+3.  **Revisar Configuración**:
+    Abre 'src/main/resources/application.properties'. Asegúrate de que las propiedades de Kafka y MongoDB sean correctas.
+
+    Contenido de 'quarkus_camel_processor/src/main/resources/application.properties':
+    '''properties
+    # Quarkus Application
+    quarkus.application.name=kafka-mongo-pipeline
+    quarkus.application.version=1.0.0
+
+    # Kafka Consumer Configuration (Camel)
+    # El nombre del topic será el que Debezium configure, ej: pgserver1.public.clientes
+    # kafka.bootstrap.servers=localhost:9092 # Configurado por quarkus.kafka.bootstrap.servers
+    quarkus.kafka.bootstrap.servers=localhost:9092
+    kafka.topic.name=pgserver1.public.clientes # Reemplaza con tu topic name exacto
+    kafka.group.id=cliente-processor-group
+
+    # MongoDB Configuration
+    quarkus.mongodb.connection-string=mongodb://localhost:27017
+    quarkus.mongodb.database=miBaseDeDatosAnalitica
+    # Si necesitas autenticación:
+    # quarkus.mongodb.credentials.username=tu_usuario_mongo
+    # quarkus.mongodb.credentials.password=tu_contraseña_mongo
+
+    # Nombre del bean del cliente Mongo para Camel (usado en la ruta)
+    mongo.client.name=defaultMongoClient
+    mongo.collection.name=clientes_transformados
+    '''
+
+4.  **Construir y Ejecutar la Aplicación Quarkus**:
+    * Modo desarrollo (con hot reload):
+        '''bash
+        ./mvnw quarkus:dev  # o mvn quarkus:dev
+        '''
+    * Construir el JAR y ejecutar:
+        '''bash
+        ./mvnw package # o mvn package
+        java -jar target/quarkus-app/quarkus-run.jar
+        '''
+
+    La aplicación comenzará a consumir mensajes del topic de Kafka, los transformará y los insertará en MongoDB.
+
+### Paso 4: MongoDB - Validación
+
+1.  **Conectarse a MongoDB**:
+    Usa 'mongosh' o MongoDB Compass para conectarte a tu instancia de MongoDB.
+    '''bash
+    mongosh mongodb://localhost:27017/miBaseDeDatosAnalitica
+    '''
+
+2.  **Ejecutar Consultas de Validación**:
+    Puedes usar las consultas en 'mongodb_validation/validation_queries.js'.
+
+    Contenido de 'mongodb_validation/validation_queries.js':
+    '''javascript
+    // Conectado a la base de datos: miBaseDeDatosAnalitica
+
+    // Verificar todos los documentos en la colección clientes_transformados
+    db.clientes_transformados.find().pretty();
+
+    // Buscar un cliente específico por email
+    // db.clientes_transformados.find({ email: "juan.perez@example.com" }).pretty();
+
+    // Contar documentos
+    // db.clientes_transformados.countDocuments();
+    '''
+    Verifica que los datos de 'clientes' aparezcan en la colección 'clientes_transformados' y que el campo 'nombre' esté en mayúsculas.
+
+## Pruebas Adicionales
+
+* **Nuevas Inserciones en PostgreSQL**: Inserta nuevas filas en la tabla 'clientes' de PostgreSQL y observa cómo aparecen en MongoDB después de unos segundos.
+    '''sql
+    INSERT INTO clientes (nombre, email) VALUES ('laura gomez', 'laura.gomez@example.com');
+    '''
+* **Actualizaciones en PostgreSQL**: Actualiza una fila existente.
+    '''sql
+    UPDATE clientes SET email = 'juan.p.revisado@example.com' WHERE nombre = 'juan perez';
+    '''
+    *Nota: La lógica actual de la ruta Camel usa 'operation=insert'. Para manejar actualizaciones de forma idempotente (actualizar si existe, insertar si no), podrías necesitar cambiar la operación a 'save' (que hace upsert basado en '_id') o implementar una lógica de búsqueda y actualización/inserción más explícita basada en 'id_postgres'.*
+
+## Limpieza (Si usas Docker)
+
+'''bash
+docker-compose down --volumes # Si usaste docker-compose
+docker stop postgres-cdc mongo-db kafka-connect kafka zookeeper
+docker rm postgres-cdc mongo-db kafka-connect kafka zookeeper

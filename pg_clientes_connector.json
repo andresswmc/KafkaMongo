@@ -1,0 +1,25 @@
+{
+  "name": "clientes-postgres-source-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "host.docker.internal",
+    "database.port": "5432",
+    "database.user": "miusuario",
+    "database.password": "micontraseña",
+    "database.dbname": "mibd",
+    "database.server.name": "pgserver1",
+    "table.include.list": "public.clientes",
+    "topic.prefix": "pgserver1",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "slot.name": "debezium_clientes_slot_v2",
+    "publication.name": "debezium_clientes_pub_v2",
+    "publication.autocreate.mode": "filtered",
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "adaptive_time_microseconds",
+    "snapshot.mode": "initial"
+  }
+}
